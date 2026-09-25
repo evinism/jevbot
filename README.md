@@ -1,6 +1,6 @@
 # jevbot
 
-Discord bot that makes [TypeSafe's Jev](https://openrouter.ai/~typesafe/jev-latest) talk — a decision model that "cannot generate text," loomed word-by-word into broken sentences.
+Discord + Slack bot that makes [TypeSafe's Jev](https://docs.typesafe.ai) talk — a decision model that "cannot generate text," loomed word-by-word into broken sentences.
 
 Jev is a non-autoregressive decision model. It answers questions with calibrated probabilities, not text. This bot gives it a 20K word vocabulary and asks "next word?" repeatedly via tournament sampling until it forms a reply.
 
@@ -27,10 +27,14 @@ Jev is a non-autoregressive decision model. It answers questions with calibrated
 pip install -r requirements.txt
 ```
 
+The generation core lives in `jev_core.py`; `jev_bot.py` (Discord) and `jev_slack.py` (Slack) are thin front-ends over it. Both take `--v1` for the original broken-grammar style.
+
+### Discord
+
 Create `.env`:
 ```
 DISCORD_TOKEN_JEV=your_discord_bot_token
-OPENROUTER_API_KEY=your_openrouter_key
+TYPESAFE_API_KEY=your_typesafe_api_key
 ```
 
 Enable **Message Content Intent** in Discord developer portal.
@@ -39,13 +43,31 @@ Enable **Message Content Intent** in Discord developer portal.
 python jev_bot.py
 ```
 
-## Usage
+Mention jev or reply to jev's messages. Replies only — it won't respond to messages that don't involve it. Say `@jev stop` to mute it in that channel/thread (it reacts 🤐 and ignores replies to it there until it's @mentioned again).
 
-Mention jev or reply to jev's messages. Replies only — it won't respond to messages that don't involve it.
+### Slack
+
+1. Go to [api.slack.com/apps](https://api.slack.com/apps) → **Create New App** → **From a manifest**, paste `slack_manifest.yaml`.
+2. **Basic Information → App-Level Tokens**: generate a token with `connections:write` (this is the `xapp-` token).
+3. **Install App** to your workspace and copy the Bot User OAuth Token (`xoxb-`).
+4. Invite jev to a channel: `/invite @jev`.
+
+Create `.env`:
+```
+SLACK_BOT_TOKEN=xoxb-...
+SLACK_APP_TOKEN=xapp-...
+TYPESAFE_API_KEY=your_typesafe_api_key
+```
+
+```bash
+python jev_slack.py
+```
+
+Uses Socket Mode, so no public URL or Request URL is needed. Jev replies in-thread when @mentioned, when someone posts in a thread jev is already in, or in DMs. It adds 👀 to your message while it thinks (Slack bots can't show a typing indicator). Say `@jev stop` in a thread to mute it there (it reacts 🤐); @mentioning it again in that thread un-mutes it. Mutes (for both platforms) are saved to `mutes.json` next to the code (override with `JEV_MUTES_FILE`) and survive restarts.
 
 ## Cost
 
-~$0.01-0.05 per reply via OpenRouter. Tournament sampling does ~6 API calls per word.
+Calls `POST https://api.typesafe.ai/v1/systemone` with `jev-latest` (set `TYPESAFE_BASE_URL` to point elsewhere). Tournament sampling does ~9 API calls per word, roughly 80 buckets × 255 words each; at $0.042 per million input tokens a reply is a fraction of a cent.
 
 ## Vocab
 
