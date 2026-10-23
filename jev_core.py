@@ -26,7 +26,7 @@ load_dotenv()
 
 TYPESAFE_KEY = os.environ["TYPESAFE_API_KEY"]
 API_URL = os.environ.get("TYPESAFE_BASE_URL", "https://api.typesafe.ai").rstrip("/") + "/v1/systemone"
-MODEL = "jev-latest"
+MODEL = "jev-preview"
 END = "<END>"
 
 # Version flag
