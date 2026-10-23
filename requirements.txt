@@ -1,5 +1,6 @@
 discord.py>=2.0
 slack-bolt>=1.18
+typesafe-sdk[pil]>=0.7.5
 aiohttp
 requests
 python-dotenv

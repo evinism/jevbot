@@ -6,6 +6,8 @@ Uses Socket Mode, so no public URL is needed. Jev replies in-thread when:
   - someone posts in a thread jev has already spoken in
   - someone DMs it
 
+Images attached to the triggering message are downloaded (needs the files:read scope) and shown to jev.
+
 "@jev stop" mutes jev in that thread; @mentioning it again there un-mutes. Mutes persist in mutes.json.
 
 Run with --v1 for the original style, default is mix.
@@ -16,6 +18,7 @@ import re
 import html
 import asyncio
 
+import aiohttp
 from slack_bolt.async_app import AsyncApp
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 
@@ -48,8 +51,34 @@ def is_from_bot(msg):
 
 
 def is_human_text(msg):
-    """Plain user-authored message (no joins, edits, bot posts, etc.)."""
-    return msg.get("subtype") is None and not is_from_bot(msg) and bool((msg.get("text") or "").strip())
+    """Plain user-authored message, possibly with files (no joins, edits, bot posts, etc.)."""
+    if msg.get("subtype") not in (None, "file_share") or is_from_bot(msg):
+        return False
+    return bool((msg.get("text") or "").strip() or msg.get("files"))
+
+
+async def fetch_images(client, files):
+    """Download the image files attached to a message; returns a list of raw bytes."""
+    out = []
+    if not files:
+        return out
+    async with aiohttp.ClientSession(headers={"Authorization": f"Bearer {BOT_TOKEN}"}) as session:
+        for f in files:
+            try:
+                if f.get("file_access") == "check_file_info":  # e.g. Slack Connect: event only has the id
+                    f = (await client.files_info(file=f["id"]))["file"]
+                if not (f.get("mimetype") or "").startswith("image/"):
+                    continue
+                url = f.get("url_private_download") or f.get("url_private")
+                async with session.get(url) as r:
+                    # Without files:read Slack serves an HTML login page with a 200.
+                    if r.status != 200 or not r.content_type.startswith("image/"):
+                        log.warning(f"image download failed for {f.get('id')}: {r.status} {r.content_type}")
+                        continue
+                    out.append(await r.read())
+            except Exception as e:
+                log.warning(f"image download failed for {f.get('id')}: {e}")
+    return out
 
 
 async def fetch_history(client, channel, thread_ts, before_ts):
@@ -102,8 +131,9 @@ async def respond(event, client):
     channel = event["channel"]
     ts = event["ts"]
     thread_ts = event.get("thread_ts") or ts  # always reply in-thread
-    text = clean(event.get("text")) or "hello"
-    log.info(f"[IN] {event.get('user')}: {text[:80]}")
+    images = await fetch_images(client, event.get("files"))
+    text = clean(event.get("text")) or ("" if images else "hello")
+    log.info(f"[IN] {event.get('user')}: {text[:80]}" + (f" [+{len(images)} image(s)]" if images else ""))
 
     # Slack bots can't show a typing indicator; an 👀 reaction is the usual stand-in.
     try:
@@ -114,7 +144,7 @@ async def respond(event, client):
     try:
         async with gen_lock:
             h = await fetch_history(client, channel, event.get("thread_ts"), ts)
-            r = await generate_reply(text, history=h)
+            r = await generate_reply(text, history=h, images=images)
         log.info(f"[OUT] {r}")
     except Exception as e:
         log.error(f"Error: {e}", exc_info=True)

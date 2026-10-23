@@ -63,11 +63,11 @@ TYPESAFE_API_KEY=your_typesafe_api_key
 python jev_slack.py
 ```
 
-Uses Socket Mode, so no public URL or Request URL is needed. Jev replies in-thread when @mentioned, when someone posts in a thread jev is already in, or in DMs. It adds 👀 to your message while it thinks (Slack bots can't show a typing indicator). Say `@jev stop` in a thread to mute it there (it reacts 🤐); @mentioning it again in that thread un-mutes it. Mutes (for both platforms) are saved to `mutes.json` next to the code (override with `JEV_MUTES_FILE`) and survive restarts.
+Uses Socket Mode, so no public URL or Request URL is needed. Jev replies in-thread when @mentioned, when someone posts in a thread jev is already in, or in DMs. It adds 👀 to your message while it thinks (Slack bots can't show a typing indicator). Attach images to the message and jev looks at them too (up to 4; PNG/JPEG/GIF/WebP, resized to fit the API's limits) — this needs the `files:read` scope, so if your app was created from an older manifest, add that scope and reinstall the app. Say `@jev stop` in a thread to mute it there (it reacts 🤐); @mentioning it again in that thread un-mutes it. Mutes (for both platforms) are saved to `mutes.json` next to the code (override with `JEV_MUTES_FILE`) and survive restarts.
 
 ## Cost
 
-Calls `POST https://api.typesafe.ai/v1/systemone` with `jev-latest` (set `TYPESAFE_BASE_URL` to point elsewhere). Tournament sampling does ~9 API calls per word, roughly 80 buckets × 255 words each; at $0.042 per million input tokens a reply is a fraction of a cent.
+Calls `POST https://api.typesafe.ai/v1/systemone` with `jev-preview` via the [TypeSafe Python SDK](https://docs.typesafe.ai/sdk/python.md) (set `TYPESAFE_BASE_URL` to point elsewhere). Image support is [dreamer-ready](https://docs.typesafe.ai/images.md), so requests with images send the `TypeSafe-Danger-Zone-Images: true` header. Images are billed as input tokens and ride along on every call, so a reply with an image costs noticeably more than a text-only one. Tournament sampling does ~9 API calls per word, roughly 80 buckets × 255 words each; at $0.042 per million input tokens a reply is a fraction of a cent.
 
 ## Vocab
 

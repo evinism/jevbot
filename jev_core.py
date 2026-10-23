@@ -9,6 +9,7 @@ v2: mode D descriptions ("...lastword candidate"), better instructions — more 
 Run with --v1 for the original style, default is mix (random v1/v2 per word).
 """
 
+import io
 import os
 import re
 import sys
@@ -19,13 +20,13 @@ from pathlib import Path
 from collections import defaultdict
 
 import json
-import aiohttp
 from dotenv import load_dotenv
+from PIL import Image as PILImage, ImageOps
+from typesafe_sdk import AsyncTypeSafeClient, Image, TypeSafeError
 
 load_dotenv()
 
 TYPESAFE_KEY = os.environ["TYPESAFE_API_KEY"]
-API_URL = os.environ.get("TYPESAFE_BASE_URL", "https://api.typesafe.ai").rstrip("/") + "/v1/systemone"
 MODEL = "jev-preview"
 END = "<END>"
 
@@ -55,7 +56,15 @@ STOPWORDS = set(
 )
 NO_SPACE_BEFORE = set(".,!?;:)\"'")
 
+# Images (dreamer-ready in the API, opt-in per request via this header)
+IMAGES_HEADER = {"TypeSafe-Danger-Zone-Images": "true"}
+MAX_IMAGES = 4
+IMAGE_MIN_SIDE = 280    # API rejects anything smaller
+IMAGE_MAX_SIDE = 1024   # API allows 1568; smaller is cheaper since the image rides along on every call
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.getLogger("typesafe_sdk").setLevel(logging.WARNING)
+logging.getLogger("httpx2").setLevel(logging.WARNING)
 log = logging.getLogger("jev")
 
 # "@jev stop" — mutes jev in the current thread. Matches "stop" / "stop!" / "Stop." only.
@@ -143,20 +152,33 @@ def penalty(reply, word):
     return p
 
 
-async def post(session, state, questions):
-    body = {"model": MODEL, "state": state, "questions": questions}
-    for attempt in range(3):
-        try:
-            async with session.post(API_URL, json=body, timeout=aiohttp.ClientTimeout(total=30)) as r:
-                data = await r.json()
-                if r.status < 400:
-                    return data.get("answers", {})
-                log.warning(f"API {r.status}: {str(data.get('detail') or data.get('error') or data)[:200]}")
-                await asyncio.sleep(1 + 2 * attempt)
-        except Exception as e:
-            log.warning(f"API err {attempt}: {e}")
-            await asyncio.sleep(1 + 2 * attempt)
-    return {}
+def prepare_image(data):
+    """Raw image file bytes -> an upright RGB JPEG sized within the API's limits, or None if unreadable."""
+    try:
+        with PILImage.open(io.BytesIO(data)) as im:
+            im.seek(0)  # first frame of GIFs/animated images
+            im = ImageOps.exif_transpose(im).convert("RGB")  # API strips EXIF, so rotate the pixels
+    except Exception as e:
+        log.warning(f"could not read image: {e}")
+        return None
+    im.thumbnail((IMAGE_MAX_SIDE, IMAGE_MAX_SIDE))
+    w, h = im.size
+    if min(w, h) < IMAGE_MIN_SIDE:
+        # Scale up toward the minimum without blowing past the max, then pad what's left.
+        scale = min(IMAGE_MIN_SIDE / min(w, h), IMAGE_MAX_SIDE / max(w, h))
+        im = im.resize((max(1, round(w * scale)), max(1, round(h * scale))), PILImage.LANCZOS)
+        canvas = PILImage.new("RGB", (max(im.width, IMAGE_MIN_SIDE), max(im.height, IMAGE_MIN_SIDE)), "white")
+        canvas.paste(im, ((canvas.width - im.width) // 2, (canvas.height - im.height) // 2))
+        im = canvas
+    return Image.from_pil(im, format="jpeg")
+
+
+async def post(client, state, questions):
+    try:
+        return await client.system_one(state=state, questions=questions)
+    except TypeSafeError as e:  # SDK already retried
+        log.warning(f"API err: {str(e)[:200]}")
+        return None
 
 
 def choice_q(words, reply_so_far="", force_mode=None):
@@ -177,81 +199,90 @@ def choice_q(words, reply_so_far="", force_mode=None):
             return choice_q(words, reply_so_far, force_mode="v2")
 
 
-async def next_word(session, state, vocab, rng, reply_so_far=""):
+async def next_word(client, state, vocab, rng, reply_so_far=""):
     shuffled = list(vocab)
     rng.shuffle(shuffled)
     buckets = [shuffled[i:i + MAX_CHOICES] for i in range(0, len(shuffled), MAX_CHOICES)]
     groups = [buckets[i:i + QUESTIONS_PER_CALL] for i in range(0, len(buckets), QUESTIONS_PER_CALL)]
 
     results = await asyncio.gather(
-        *(post(session, state, {f"b{gi * QUESTIONS_PER_CALL + i}": choice_q(b, reply_so_far)
+        *(post(client, state, {f"b{gi * QUESTIONS_PER_CALL + i}": choice_q(b, reply_so_far)
                                 for i, b in enumerate(g)})
           for gi, g in enumerate(groups)),
-        post(session, state, {"complete": {"type": "noul", "instructions": "Is the reply complete?"}}),
+        post(client, state, {"complete": {"type": "noul", "instructions": "Is the reply complete?"}}),
     )
 
-    complete_noul = results[-1].get("complete", {}).get("noul", 0)
+    complete_noul = results[-1].nouls["complete"].noul if results[-1] else 0
 
     finalists = []
-    for group_answers in results[:-1]:
-        for ans in group_answers.values():
-            if "probabilities" not in ans:
-                continue
-            ranked = sorted(ans["probabilities"].items(), key=lambda kv: -kv[1])
+    for res in results[:-1]:
+        if not res:
+            continue
+        for ans in res.choices.values():
+            ranked = sorted(ans.probabilities.items(), key=lambda kv: -kv[1])
             finalists += [w for w, p in ranked[:TOP_PER_BUCKET] if p > 0]
 
     if END not in finalists:
         finalists.append(END)
 
-    runoff = await post(session, state, {"final": choice_q(finalists[:MAX_CHOICES], reply_so_far)})
-    probs = runoff.get("final", {}).get("probabilities", {})
+    runoff = await post(client, state, {"final": choice_q(finalists[:MAX_CHOICES], reply_so_far)})
+    probs = runoff.choices["final"].probabilities if runoff else {}
 
     return probs, complete_noul
 
 
-async def generate_reply(message, history=None):
+async def generate_reply(message, history=None, images=None):
+    """`images` is a list of raw image file bytes attached to `message` (PNG/JPEG/GIF/WebP...)."""
+    assets = [a for a in (prepare_image(d) for d in (images or [])[:MAX_IMAGES]) if a]
+    user_turn = " ".join([message] + [str(a) for a in assets]).strip()  # str(asset) is its reference
+    if assets:
+        log.info(f"  with {len(assets)} image(s)")
+
+    client = AsyncTypeSafeClient(api_key=TYPESAFE_KEY, model=MODEL, timeout=30,
+                                 headers=IMAGES_HEADER if assets else None)
+    async with client:
+        with client.attach_assets(assets):
+            return await loom(client, user_turn, history, vocabulary(message))
+
+
+async def loom(client, user_turn, history, vocab):
     rng = random.Random()
-    vocab = vocabulary(message)
     words = []
+    for step in range(MAX_WORDS):
+        turns = []
+        if history:
+            for h in history:
+                name = "Jev" if h["role"] == "assistant" else "User"
+                turns.append(f"{name}: {h['content']}")
+        turns.append(f"User: {user_turn}")
+        turns.append(f"Jev: {render(words)}")
+        state = "\n".join(turns)
 
-    headers = {"Authorization": f"Bearer {TYPESAFE_KEY}", "Content-Type": "application/json"}
+        probs, complete = await next_word(client, state, vocab, rng, reply_so_far=render(words))
+        if not probs:
+            break
 
-    async with aiohttp.ClientSession(headers=headers) as session:
-        for step in range(MAX_WORDS):
-            turns = []
-            if history:
-                for h in history:
-                    name = "Jev" if h["role"] == "assistant" else "User"
-                    turns.append(f"{name}: {h['content']}")
-            turns.append(f"User: {message}")
-            turns.append(f"Jev: {render(words)}")
-            state = "\n".join(turns)
+        stoppable = sum(1 for w in words if w.isalnum()) >= MIN_WORDS
+        if stoppable and complete >= STOP_THRESHOLD:
+            log.info(f"  noul={complete:.2f} stop")
+            break
 
-            probs, complete = await next_word(session, state, vocab, rng, reply_so_far=render(words))
-            if not probs:
-                break
+        scored = {}
+        for w, p in probs.items():
+            if p <= 0: continue
+            if w in NO_SPACE_BEFORE and words[-1:] == [w]: continue
+            if w == END and not stoppable: continue
+            scored[w] = p / penalty(words, w)
 
-            stoppable = sum(1 for w in words if w.isalnum()) >= MIN_WORDS
-            if stoppable and complete >= STOP_THRESHOLD:
-                log.info(f"  noul={complete:.2f} stop")
-                break
+        if not scored: break
 
-            scored = {}
-            for w, p in probs.items():
-                if p <= 0: continue
-                if w in NO_SPACE_BEFORE and words[-1:] == [w]: continue
-                if w == END and not stoppable: continue
-                scored[w] = p / penalty(words, w)
+        ranked = sorted(scored.items(), key=lambda kv: -kv[1])
+        word = ranked[0][0]
 
-            if not scored: break
+        top3 = [(w, probs.get(w, 0)) for w, _ in ranked[:3]]
+        log.info(f"  [{step+1:2d}] {word:12s}  {' '.join(f'{w}:{p:.0%}' for w,p in top3)}  done={complete:.2f}")
 
-            ranked = sorted(scored.items(), key=lambda kv: -kv[1])
-            word = ranked[0][0]
-
-            top3 = [(w, probs.get(w, 0)) for w, _ in ranked[:3]]
-            log.info(f"  [{step+1:2d}] {word:12s}  {' '.join(f'{w}:{p:.0%}' for w,p in top3)}  done={complete:.2f}")
-
-            if word == END: break
-            words.append(word)
+        if word == END: break
+        words.append(word)
 
     return render(words) if words else "..."
