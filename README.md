@@ -63,7 +63,7 @@ TYPESAFE_API_KEY=your_typesafe_api_key
 python jev_slack.py
 ```
 
-Uses Socket Mode, so no public URL or Request URL is needed. Jev replies in-thread when @mentioned, when someone posts in a thread jev is already in, or in DMs. It adds 👀 to your message while it thinks (Slack bots can't show a typing indicator). Attach images to the message and jev looks at them too (up to 4; PNG/JPEG/GIF/WebP, resized to fit the API's limits) — this needs the `files:read` scope, so if your app was created from an older manifest, add that scope and reinstall the app. Say `@jev stop` in a thread to mute it there (it reacts 🤐); @mentioning it again in that thread un-mutes it. Mutes (for both platforms) are saved to `mutes.json` next to the code (override with `JEV_MUTES_FILE`) and survive restarts.
+Uses Socket Mode, so no public URL or Request URL is needed. Jev replies in-thread when @mentioned, when someone posts in a thread jev is already in, or in DMs. Context is per thread: inside a thread jev reads the last few messages of that thread, while a top-level @mention or DM only sees that one message. It adds 👀 to your message while it thinks (Slack bots can't show a typing indicator). Jev also looks at images (PNG/JPEG/GIF/WebP, resized to fit the API's limits) attached to the message and to the earlier messages it reads as context — this needs the `files:read` scope, so if your app was created from an older manifest, add that scope and reinstall the app. Say `@jev stop` in a thread to mute it there (it reacts 🤐); @mentioning it again in that thread un-mutes it. Mutes (for both platforms) are saved to `mutes.json` next to the code (override with `JEV_MUTES_FILE`) and survive restarts.
 
 ## Cost
 

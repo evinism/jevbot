@@ -58,7 +58,6 @@ NO_SPACE_BEFORE = set(".,!?;:)\"'")
 
 # Images (dreamer-ready in the API, opt-in per request via this header)
 IMAGES_HEADER = {"TypeSafe-Danger-Zone-Images": "true"}
-MAX_IMAGES = 4
 IMAGE_MIN_SIDE = 280    # API rejects anything smaller
 IMAGE_MAX_SIDE = 1024   # API allows 1568; smaller is cheaper since the image rides along on every call
 
@@ -232,9 +231,17 @@ async def next_word(client, state, vocab, rng, reply_so_far=""):
 
 
 async def generate_reply(message, history=None, images=None):
-    """`images` is a list of raw image file bytes attached to `message` (PNG/JPEG/GIF/WebP...)."""
-    assets = [a for a in (prepare_image(d) for d in (images or [])[:MAX_IMAGES]) if a]
-    user_turn = " ".join([message] + [str(a) for a in assets]).strip()  # str(asset) is its reference
+    """`images` (and each history item's optional "images") are raw image file bytes (PNG/JPEG/GIF/WebP...)."""
+    assets = []
+
+    def turn(name, text, imgs):
+        prepared = [a for a in map(prepare_image, imgs or []) if a]
+        assets.extend(prepared)
+        return " ".join([f"{name}:"] + [text] * bool(text) + [str(a) for a in prepared])  # str(asset) is its reference
+
+    turns = [turn("Jev" if h["role"] == "assistant" else "User", h["content"], h.get("images"))
+             for h in history or []]
+    turns.append(turn("User", message, images))
     if assets:
         log.info(f"  with {len(assets)} image(s)")
 
@@ -242,21 +249,14 @@ async def generate_reply(message, history=None, images=None):
                                  headers=IMAGES_HEADER if assets else None)
     async with client:
         with client.attach_assets(assets):
-            return await loom(client, user_turn, history, vocabulary(message))
+            return await loom(client, "\n".join(turns), vocabulary(message))
 
 
-async def loom(client, user_turn, history, vocab):
+async def loom(client, context, vocab):
     rng = random.Random()
     words = []
     for step in range(MAX_WORDS):
-        turns = []
-        if history:
-            for h in history:
-                name = "Jev" if h["role"] == "assistant" else "User"
-                turns.append(f"{name}: {h['content']}")
-        turns.append(f"User: {user_turn}")
-        turns.append(f"Jev: {render(words)}")
-        state = "\n".join(turns)
+        state = f"{context}\nJev: {render(words)}"
 
         probs, complete = await next_word(client, state, vocab, rng, reply_so_far=render(words))
         if not probs:

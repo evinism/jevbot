@@ -6,7 +6,8 @@ Uses Socket Mode, so no public URL is needed. Jev replies in-thread when:
   - someone posts in a thread jev has already spoken in
   - someone DMs it
 
-Images attached to the triggering message are downloaded (needs the files:read scope) and shown to jev.
+Images attached to the triggering message and to the history messages are downloaded (needs the
+files:read scope) and shown to jev alongside the text they were posted with.
 
 "@jev stop" mutes jev in that thread; @mentioning it again there un-mutes. Mutes persist in mutes.json.
 
@@ -82,28 +83,32 @@ async def fetch_images(client, files):
 
 
 async def fetch_history(client, channel, thread_ts, before_ts):
-    """Last N user messages before `before_ts` — from the thread if in one, else the channel."""
-    lines = []
+    """Last N user messages (with their images) in the thread before `before_ts`.
+
+    Outside a thread (top-level mentions, top-level DMs) there is no history: jev sees only the message
+    itself, so unrelated channel/DM chatter never leaks into a reply.
+    """
+    if not thread_ts:
+        return []
+    kept = []
     try:
-        if thread_ts:
-            res = await client.conversations_replies(channel=channel, ts=thread_ts, limit=100)
-            msgs = res.get("messages", [])
-        else:
-            res = await client.conversations_history(channel=channel, latest=before_ts,
-                                                     inclusive=False, limit=30)
-            msgs = list(reversed(res.get("messages", [])))  # history is newest-first
-        for m in msgs:
+        res = await client.conversations_replies(channel=channel, ts=thread_ts, limit=100)
+        for m in res.get("messages", []):
             if float(m.get("ts", 0)) >= float(before_ts):
                 continue
             if not is_human_text(m):
                 continue
-            text = clean(m["text"])
-            if text and not text.startswith("."):
-                lines.append(text)
+            text = clean(m.get("text"))
+            if not text.startswith("."):
+                kept.append((text, m.get("files")))
     except Exception as e:
         log.warning(f"history fetch failed: {e}")
-    lines = lines[-MAX_HISTORY:]
-    return [{"role": "user", "content": t} for t in lines]
+    history = []
+    for text, files in kept[-MAX_HISTORY:]:
+        images = await fetch_images(client, files)
+        if text or images:
+            history.append({"role": "user", "content": text, "images": images})
+    return history
 
 
 async def bot_in_thread(client, channel, thread_ts):
