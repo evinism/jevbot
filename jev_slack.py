@@ -9,6 +9,8 @@ Uses Socket Mode, so no public URL is needed. Jev replies in-thread when:
 Images attached to the triggering message and to the history messages are downloaded (needs the
 files:read scope) and shown to jev alongside the text they were posted with.
 
+Messages starting with "!" are invisible to jev: it never replies to them or sees them in history.
+
 "@jev stop" mutes jev in that thread; @mentioning it again there un-mutes. Mutes persist in mutes.json.
 
 Run with --v1 for the original style, default is mix.
@@ -23,7 +25,7 @@ import aiohttp
 from slack_bolt.async_app import AsyncApp
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 
-from jev_core import BASE_VOCAB, MAX_HISTORY, MUTES, V1_MODE, generate_reply, is_stop_command, log
+from jev_core import BASE_VOCAB, MAX_HISTORY, MUTES, V1_MODE, generate_reply, is_aside, is_stop_command, log
 
 BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]   # xoxb-...
 APP_TOKEN = os.environ["SLACK_APP_TOKEN"]   # xapp-... (Socket Mode, connections:write)
@@ -99,7 +101,7 @@ async def fetch_history(client, channel, thread_ts, before_ts):
             if not is_human_text(m):
                 continue
             text = clean(m.get("text"))
-            if not text.startswith("."):
+            if not text.startswith(".") and not is_aside(text):
                 kept.append((text, m.get("files")))
     except Exception as e:
         log.warning(f"history fetch failed: {e}")
@@ -167,6 +169,8 @@ async def respond(event, client):
 
 @app.event("app_mention")
 async def on_mention(event, client):
+    if is_aside(clean(event.get("text"))):
+        return
     if is_stop_command(clean(event.get("text"))):
         await stop_thread(event, client)
         return
@@ -177,7 +181,7 @@ async def on_mention(event, client):
 
 @app.event("message")
 async def on_message(event, client):
-    if not is_human_text(event):
+    if not is_human_text(event) or is_aside(clean(event.get("text"))):
         return
     # Mentions are handled by app_mention; don't double-reply.
     if BOT_USER_ID and f"<@{BOT_USER_ID}>" in (event.get("text") or ""):

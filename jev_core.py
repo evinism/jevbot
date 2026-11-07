@@ -74,6 +74,11 @@ def is_stop_command(text):
     return bool(STOP_CMD_RE.match(text or ""))
 
 
+def is_aside(text):
+    """Messages starting with "!" are invisible to jev: never replied to, never included in history."""
+    return (text or "").lstrip().startswith("!")
+
+
 class MuteStore:
     """Set of muted thread keys, persisted to a JSON file so mutes survive restarts.
 

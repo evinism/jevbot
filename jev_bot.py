@@ -11,7 +11,7 @@ import asyncio
 import discord
 from discord.ext import commands
 
-from jev_core import BASE_VOCAB, MAX_HISTORY, MUTES, V1_MODE, generate_reply, is_stop_command, log
+from jev_core import BASE_VOCAB, MAX_HISTORY, MUTES, V1_MODE, generate_reply, is_aside, is_stop_command, log
 
 TOKEN = os.environ["DISCORD_TOKEN_JEV"]
 
@@ -26,8 +26,8 @@ async def fetch_history(channel, before_msg):
             text = (msg.content or "").strip()
             if not text:
                 continue
-            # Skip bot commands
-            if text.startswith("."):
+            # Skip bot commands and asides
+            if text.startswith(".") or is_aside(strip_mention(text, bot.user.id)):
                 continue
             lines.append(text)
             if len(lines) >= MAX_HISTORY:
@@ -51,6 +51,7 @@ def strip_mention(c, bid):
 
 def should_respond(m):
     if m.author.bot: return False
+    if is_aside(strip_mention(m.content, bot.user.id)): return False
     if bot.user in m.mentions: return True
     if m.reference and m.reference.resolved:
         r = m.reference.resolved
