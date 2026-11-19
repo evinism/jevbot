@@ -12,8 +12,6 @@ files:read scope) and shown to jev alongside the text they were posted with.
 Messages starting with "!" are invisible to jev: it never replies to them or sees them in history.
 
 "@jev stop" mutes jev in that thread; @mentioning it again there un-mutes. Mutes persist in mutes.json.
-
-Run with --v1 for the original style, default is mix.
 """
 
 import os
@@ -25,7 +23,7 @@ import aiohttp
 from slack_bolt.async_app import AsyncApp
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 
-from jev_core import BASE_VOCAB, MAX_HISTORY, MUTES, V1_MODE, generate_reply, is_aside, is_stop_command, log
+from jev_core import BASE_VOCAB, MAX_HISTORY, MUTES, generate_reply, is_aside, is_stop_command, log
 
 BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]   # xoxb-...
 APP_TOKEN = os.environ["SLACK_APP_TOKEN"]   # xapp-... (Socket Mode, connections:write)
@@ -33,6 +31,7 @@ APP_TOKEN = os.environ["SLACK_APP_TOKEN"]   # xapp-... (Socket Mode, connections
 app = AsyncApp(token=BOT_TOKEN)
 gen_lock = asyncio.Lock()
 BOT_USER_ID = None  # filled on startup via auth.test
+USER_NAMES = {}  # user id -> display name
 
 
 def mute_key(channel, thread_ts):
@@ -51,6 +50,22 @@ def clean(text):
 
 def is_from_bot(msg):
     return msg.get("user") == BOT_USER_ID or msg.get("bot_id") is not None
+
+
+def is_jev_text(msg):
+    return msg.get("user") == BOT_USER_ID and msg.get("subtype") in (None, "bot_message") and bool(msg.get("text"))
+
+
+async def display_name(client, user_id):
+    """Slack display name for a user (cached), so different people in a thread look different to jev."""
+    if user_id not in USER_NAMES:
+        try:
+            profile = (await client.users_info(user=user_id))["user"]["profile"]
+            USER_NAMES[user_id] = profile.get("display_name") or profile.get("real_name") or "User"
+        except Exception as e:
+            log.warning(f"users.info failed for {user_id}: {e}")
+            return "User"
+    return USER_NAMES[user_id]
 
 
 def is_human_text(msg):
@@ -85,7 +100,7 @@ async def fetch_images(client, files):
 
 
 async def fetch_history(client, channel, thread_ts, before_ts):
-    """Last N user messages (with their images) in the thread before `before_ts`.
+    """Last N messages from humans and jev (with their images) in the thread before `before_ts`.
 
     Outside a thread (top-level mentions, top-level DMs) there is no history: jev sees only the message
     itself, so unrelated channel/DM chatter never leaks into a reply.
@@ -98,18 +113,24 @@ async def fetch_history(client, channel, thread_ts, before_ts):
         for m in res.get("messages", []):
             if float(m.get("ts", 0)) >= float(before_ts):
                 continue
-            if not is_human_text(m):
-                continue
-            text = clean(m.get("text"))
-            if not text.startswith(".") and not is_aside(text):
-                kept.append((text, m.get("files")))
+            if is_jev_text(m):
+                kept.append(m)
+            elif is_human_text(m):
+                text = clean(m.get("text"))
+                if not text.startswith(".") and not is_aside(text):
+                    kept.append(m)
     except Exception as e:
         log.warning(f"history fetch failed: {e}")
     history = []
-    for text, files in kept[-MAX_HISTORY:]:
-        images = await fetch_images(client, files)
+    for m in kept[-MAX_HISTORY:]:
+        text = clean(m.get("text"))
+        if is_jev_text(m):
+            history.append({"role": "assistant", "content": text})
+            continue
+        images = await fetch_images(client, m.get("files"))
         if text or images:
-            history.append({"role": "user", "content": text, "images": images})
+            history.append({"role": "user", "name": await display_name(client, m.get("user")),
+                            "content": text, "images": images})
     return history
 
 
@@ -151,7 +172,8 @@ async def respond(event, client):
     try:
         async with gen_lock:
             h = await fetch_history(client, channel, event.get("thread_ts"), ts)
-            r = await generate_reply(text, history=h, images=images)
+            author = await display_name(client, event.get("user"))
+            r = await generate_reply(text, history=h, images=images, author=author)
         log.info(f"[OUT] {r}")
     except Exception as e:
         log.error(f"Error: {e}", exc_info=True)
@@ -202,7 +224,7 @@ async def main():
     global BOT_USER_ID
     auth = await app.client.auth_test()
     BOT_USER_ID = auth["user_id"]
-    log.info(f"jev online as @{auth['user']} ({BOT_USER_ID}) | vocab {len(BASE_VOCAB)} | {'v1' if V1_MODE else 'mix'}")
+    log.info(f"jev online as @{auth['user']} ({BOT_USER_ID}) | vocab {len(BASE_VOCAB)}")
     await AsyncSocketModeHandler(app, APP_TOKEN).start_async()
 
 

@@ -3,21 +3,16 @@ Jev core — tournament-sampled loomed text from TypeSafe's decision model.
 
 Shared by the Discord (jev_bot.py) and Slack (jev_slack.py) front-ends.
 
-v1: empty descriptions, "Next word?" — the original broken-grammar jev
-v2: mode D descriptions ("...lastword candidate"), better instructions — more coherent
-
-Run with --v1 for the original style, default is mix (random v1/v2 per word).
+Each step scores the whole vocab in a tournament, then looks two words ahead and picks the best phrase.
 """
 
 import io
 import os
 import re
-import sys
 import asyncio
 import logging
 import random
 from pathlib import Path
-from collections import defaultdict
 
 import json
 from dotenv import load_dotenv
@@ -30,15 +25,25 @@ TYPESAFE_KEY = os.environ["TYPESAFE_API_KEY"]
 MODEL = "jev-preview"
 END = "<END>"
 
-# Version flag
-V1_MODE = "--v1" in sys.argv
+# Prompts. The header frames the state so jev knows it is *writing* the last line, not judging it.
+HEADER = "Chat transcript. The last line is Jev's reply so far; it may be unfinished.\n\n"
+WORD_INSTRUCTIONS = "What is the next word of Jev's reply?"
+FOLLOW_INSTRUCTIONS = "Next two words of Jev's reply?"
+PHRASE_INSTRUCTIONS = "Best continuation of Jev's reply?"
+COMPLETE_INSTRUCTIONS = ("Is Jev's reply complete? Judge only whether the message is finished, "
+                         "not whether it is helpful or correct.")
+END_LABEL = "[reply ends here]"
+PREVIEW_TAIL = 60
 
 MAX_CHOICES = 255
-QUESTIONS_PER_CALL = 20 if V1_MODE else 10  # mix mode averages out; pure v1 can pack more
+QUESTIONS_PER_CALL = 10
 TOP_PER_BUCKET = 2
+LOOKAHEAD_HEADS = 6
+LOOKAHEAD_FINALISTS = 40
+LOOKAHEAD_FOLLOWS = 2
 MAX_WORDS = 30
-MIN_WORDS = 2
-MAX_HISTORY = 5
+MIN_WORDS = 1
+MAX_HISTORY = 8
 STOP_THRESHOLD = 0.5
 REPEAT_PENALTY = 1.5
 REPEAT_WINDOW = 8
@@ -122,8 +127,10 @@ MUTES = MuteStore(os.environ.get("JEV_MUTES_FILE", Path(__file__).parent / "mute
 # Vocab
 VOCAB_PATH = Path(__file__).parent / "vocab.txt"
 BANNED = {"unanswered", "\\n"}
-BASE_VOCAB = [w for w in VOCAB_PATH.read_text().split("\n") if w and w.lower() not in BANNED]
-log.info(f"Loaded {len(BASE_VOCAB)} vocab words | {'v1' if V1_MODE else 'mix'} mode")
+EXTRA_VOCAB = ["jev"] + [str(n) for n in range(10, 1001)]
+BASE_VOCAB = list(dict.fromkeys(
+    [w for w in VOCAB_PATH.read_text().split("\n") if w and w.lower() not in BANNED] + EXTRA_VOCAB))
+log.info(f"Loaded {len(BASE_VOCAB)} vocab words")
 
 
 def render(tokens):
@@ -138,11 +145,30 @@ def render(tokens):
     return re.sub(r"(^|[.!?]\s+|\n)([a-z])", lambda m: m.group(1) + m.group(2).upper(), out.strip())
 
 
-def vocabulary(message):
+def vocabulary(texts):
+    """Base vocab plus any new words (and numbers) from the conversation."""
     seen = set(BASE_VOCAB)
-    extra = [w for w in re.findall(r"[A-Za-z']+", message.lower())
+    extra = [w for w in re.findall(r"[A-Za-z0-9']+", "\n".join(texts).lower())
              if w not in seen and not seen.add(w)]
     return BASE_VOCAB + extra + [END]
+
+
+def preview(words, ends=False):
+    """Jev's reply-so-far as it would read with `words`, for describing lookahead options."""
+    text = render(words)
+    text = "…" + text[-PREVIEW_TAIL:] if len(text) > PREVIEW_TAIL else text
+    return f"Jev: {text}" + (f" {END_LABEL}" if ends else "")
+
+
+def stoppable(words):
+    return sum(1 for w in words if w.isalnum()) >= MIN_WORDS
+
+
+def ranked(probs, words, count, keep_end=False):
+    """Top `count` options by penalized probability, skipping doubled punctuation."""
+    scored = {w: p / penalty(words, w) for w, p in probs.items()
+              if p > 0 and (keep_end or w != END) and not (w in NO_SPACE_BEFORE and words[-1:] == [w])}
+    return sorted(scored, key=scored.get, reverse=True)[:count]
 
 
 def penalty(reply, word):
@@ -185,22 +211,14 @@ async def post(client, state, questions):
         return None
 
 
-def choice_q(words, reply_so_far="", force_mode=None):
-    mode = force_mode or ("v1" if V1_MODE else "mix")
-    if mode == "v1":
-        return {"type": "choice", "instructions": "Next word?",
-                "criteria": {w: "" for w in words}}
-    elif mode == "v2":
-        last = reply_so_far.split()[-1] if reply_so_far.split() else ""
-        criteria = {w: f"...{last} {w}" if last else w for w in words}
-        return {"type": "choice", "instructions": "Next word?",
-                "criteria": criteria}
-    else:
-        # mix: randomly v1 or v2 each call
-        if random.random() < 0.5:
-            return choice_q(words, reply_so_far, force_mode="v1")
-        else:
-            return choice_q(words, reply_so_far, force_mode="v2")
+def choice_q(words, reply_so_far=""):
+    last = reply_so_far.split()[-1] if reply_so_far.split() else ""
+
+    def describe(w):
+        shown = END_LABEL if w == END else w
+        return f"...{last} {shown}" if last else shown
+
+    return {"type": "choice", "instructions": WORD_INSTRUCTIONS, "criteria": {w: describe(w) for w in words}}
 
 
 async def next_word(client, state, vocab, rng, reply_so_far=""):
@@ -213,7 +231,7 @@ async def next_word(client, state, vocab, rng, reply_so_far=""):
         *(post(client, state, {f"b{gi * QUESTIONS_PER_CALL + i}": choice_q(b, reply_so_far)
                                 for i, b in enumerate(g)})
           for gi, g in enumerate(groups)),
-        post(client, state, {"complete": {"type": "noul", "instructions": "Is the reply complete?"}}),
+        post(client, state, {"complete": {"type": "noul", "instructions": COMPLETE_INSTRUCTIONS}}),
     )
 
     complete_noul = results[-1].nouls["complete"].noul if results[-1] else 0
@@ -235,8 +253,45 @@ async def next_word(client, state, vocab, rng, reply_so_far=""):
     return probs, complete_noul
 
 
-async def generate_reply(message, history=None, images=None):
-    """`images` (and each history item's optional "images") are raw image file bytes (PNG/JPEG/GIF/WebP...)."""
+async def lookahead(client, state, probs, words):
+    """Pick the best 1-2 word continuation, so answers split over several words can outvote a single hedge.
+
+    Returns (phrase, reply ends after it), or None if the API failed.
+    """
+    heads = ranked(probs, words, LOOKAHEAD_HEADS)
+    finalists = ranked(probs, words, LOOKAHEAD_FINALISTS) + [END]
+    follow = await post(client, state, {
+        f"h{i}": {"type": "choice", "instructions": FOLLOW_INSTRUCTIONS,
+                  "criteria": {w: preview(words + [head] + [w] * (w != END), w == END) for w in finalists}}
+        for i, head in enumerate(heads)})
+
+    options = {END: ([], True)} if stoppable(words) else {}
+    for i, head in enumerate(heads):
+        follows = ranked(follow.choices[f"h{i}"].probabilities, words + [head], LOOKAHEAD_FOLLOWS, keep_end=True) \
+            if follow else [None]
+        for w in follows:
+            phrase = [head] + [w] * (w not in (None, END))
+            options[" ".join(phrase) + f" {END}" * (w == END)] = (phrase, w == END)
+    if not options:
+        return None
+
+    final = await post(client, state, {"final": {
+        "type": "choice", "instructions": PHRASE_INSTRUCTIONS,
+        "criteria": {key: preview(words + phrase, ends) for key, (phrase, ends) in options.items()}}})
+    if not final:
+        return None
+    final_probs = final.choices["final"].probabilities
+    best = max(options, key=lambda key: final_probs.get(key, 0))
+    top3 = sorted(final_probs.items(), key=lambda kv: -kv[1])[:3]
+    log.info(f"  {best!r:24s}  {'  '.join(f'{k}:{p:.0%}' for k, p in top3)}")
+    return options[best]
+
+
+async def generate_reply(message, history=None, images=None, author="User"):
+    """`images` (and each history item's optional "images") are raw image file bytes (PNG/JPEG/GIF/WebP...).
+
+    History items are {"role": "user" | "assistant", "content", optional "name", optional "images"}.
+    """
     assets = []
 
     def turn(name, text, imgs):
@@ -244,9 +299,10 @@ async def generate_reply(message, history=None, images=None):
         assets.extend(prepared)
         return " ".join([f"{name}:"] + [text] * bool(text) + [str(a) for a in prepared])  # str(asset) is its reference
 
-    turns = [turn("Jev" if h["role"] == "assistant" else "User", h["content"], h.get("images"))
-             for h in history or []]
-    turns.append(turn("User", message, images))
+    history = history or []
+    turns = [turn("Jev" if h["role"] == "assistant" else h.get("name", "User"), h["content"], h.get("images"))
+             for h in history]
+    turns.append(turn(author, message, images))
     if assets:
         log.info(f"  with {len(assets)} image(s)")
 
@@ -254,40 +310,28 @@ async def generate_reply(message, history=None, images=None):
                                  headers=IMAGES_HEADER if assets else None)
     async with client:
         with client.attach_assets(assets):
-            return await loom(client, "\n".join(turns), vocabulary(message))
+            return await loom(client, "\n".join(turns), vocabulary([h["content"] for h in history] + [message]))
 
 
 async def loom(client, context, vocab):
     rng = random.Random()
     words = []
-    for step in range(MAX_WORDS):
-        state = f"{context}\nJev: {render(words)}"
+    while len(words) < MAX_WORDS:
+        state = f"{HEADER}{context}\nJev: {render(words)}"
 
         probs, complete = await next_word(client, state, vocab, rng, reply_so_far=render(words))
+        if stoppable(words) and complete >= STOP_THRESHOLD:
+            log.info(f"  noul={complete:.2f} stop")
+            break
         if not probs:
             break
 
-        stoppable = sum(1 for w in words if w.isalnum()) >= MIN_WORDS
-        if stoppable and complete >= STOP_THRESHOLD:
-            log.info(f"  noul={complete:.2f} stop")
+        step = await lookahead(client, state, probs, words)
+        if not step:
             break
-
-        scored = {}
-        for w, p in probs.items():
-            if p <= 0: continue
-            if w in NO_SPACE_BEFORE and words[-1:] == [w]: continue
-            if w == END and not stoppable: continue
-            scored[w] = p / penalty(words, w)
-
-        if not scored: break
-
-        ranked = sorted(scored.items(), key=lambda kv: -kv[1])
-        word = ranked[0][0]
-
-        top3 = [(w, probs.get(w, 0)) for w, _ in ranked[:3]]
-        log.info(f"  [{step+1:2d}] {word:12s}  {' '.join(f'{w}:{p:.0%}' for w,p in top3)}  done={complete:.2f}")
-
-        if word == END: break
-        words.append(word)
+        phrase, ends = step
+        words += phrase
+        if ends:
+            break
 
     return render(words) if words else "..."
